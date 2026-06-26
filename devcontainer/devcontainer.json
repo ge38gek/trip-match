@@ -1,0 +1,19 @@
+{
+  "name": "TripMatch Database Architecture Workspace",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "features": {
+    "ghcr.io/devcontainers/features/postgres:1": {
+      "version": "16"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "qwtel.sqlite-viewer",
+        "prisma.prisma",
+        "ckinfinite.mementodb"
+      ]
+    }
+  },
+  "postCreateCommand": "echo 'Codespace is ready! Postgres is initializing...'"
+}
