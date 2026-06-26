@@ -1,9 +1,12 @@
 import json
 import hashlib
 import uuid
-import urllib.request
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from pipeline.providers.ticketmaster import TicketmasterProvider
+
+# Replace this with your actual key from developer.ticketmaster.com
+TICKETMASTER_API_KEY = "tUzMAZSDKALtOAGiAwOaIFrgRJLBbB7m"
 
 DB_CONFIG = {
     "host": "localhost",
@@ -13,135 +16,134 @@ DB_CONFIG = {
     "password": "password"
 }
 
-def fetch_live_provider_payloads():
-    """
-    Simulates a live network request pulling raw data directly matching 
-    the Ticketmaster Discovery API /v2/events.json payload structure.
-    """
-    print("📡 Fetching latest event data streaming feed...")
+def run_global_sync():
+    print("⚡ [ORCHESTRATOR] Launching TripMatch Live Sync Engine...")
     
-    # In a fully deployed environment, this replaces with:
-    # url = "https://app.ticketmaster.com/discovery/v2/events.json?apikey=YOUR_KEY&city=Berlin"
-    # response = urllib.request.urlopen(url).read()
-    
-    # We explicitly simulate the real-time nested schema structure Ticketmaster feeds back:
-    sample_api_response = {
-        "_embedded": {
-            "events": [
-                {
-                    "id": "tm-ticket-101010",
-                    "name": "Charlotte de Witte - KNTXT Berlin",
-                    "dates": {
-                        "start": {
-                            "dateTime": "2026-10-31T22:00:00Z",
-                            "timezone": "Europe/Berlin"
-                        },
-                        "end": {
-                            "dateTime": "2026-11-01T08:00:00Z"
-                        }
-                    },
-                    "classifications": [{"genre": {"name": "Techno"}}],
-                    "venue_external_id": "deadeade-adea-dead-ea00-000000000001", # Tresor Berlin
-                    "city_external_id": "c1111111-1111-1111-1111-111111111111",  # Berlin
-                    "tags": ["#electronic", "#techno", "#kntxt"]
-                }
-            ]
-        }
-    }
-    return sample_api_response["_embedded"]["events"]
-
-def run_automated_sync():
-    print("⚡ Launching TripMatch Orchestrator Loop...")
+    # 1. Initialize DB Connection and Provider Driver
     conn = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor(cursor_factory=RealDictCursor)
+    provider_name = "ticketmaster_v2"
+    driver = TicketmasterProvider(api_key=TICKETMASTER_API_KEY)
     
-    job_id = str(uuid.uuid4())
-    provider = "ticketmaster_v2"
+    # 2. Query the core database for active target routing destinations
+    cursor.execute("SELECT id, name, english_name, country_code FROM cities;")
+    target_cities = cursor.fetchall()
     
-    # 1. Log Ingestion Job run entry
-    cursor.execute(
-        "INSERT INTO ingestion_jobs (id, provider_name, status) VALUES (%s, %s, 'running');",
-        (job_id, provider)
-    )
-    conn.commit()
+    print(f"🗺️  Found {len(target_cities)} destination targets in database to sync.")
     
-    try:
-        raw_events = fetch_live_provider_payloads()
-        imported = 0
-        skipped = 0
+    for city in target_cities:
+        print(f"\n🚀 Processing Sector: {city['english_name']} ({city['country_code']})")
         
-        for ext_event in raw_events:
-            # Generate immutable hash fingerprint from the raw data block
-            serialized_payload = json.dumps(ext_event, sort_keys=True)
+        # Open a distinct operational tracking job profile for this city sequence
+        job_id = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO ingestion_jobs (id, provider_name, target_city_id, status) 
+            VALUES (%s, %s, %s, 'running');
+            """,
+            (job_id, provider_name, city['id'])
+        )
+        conn.commit()
+        
+        # Fetch the live stream payload from Ticketmaster API
+        raw_events = driver.fetch_city_music_events(
+            city_name=city['english_name'], 
+            country_code=city['country_code']
+        )
+        
+        records_found = len(raw_events)
+        records_imported = 0
+        duplicates_blocked = 0
+        
+        for item in raw_events:
+            # Generate immutable SHA-256 fingerprint hash of the item payload
+            serialized_payload = json.dumps(item, sort_keys=True)
             payload_hash = hashlib.sha256(serialized_payload.encode('utf-8')).hexdigest()
             
-            # De-duplication Protection check via exact fingerprint lookup
+            # De-duplication check
             cursor.execute(
-                "SELECT id FROM raw_payloads WHERE provider_name = %s AND provider_event_id = %s AND payload_hash = %s;",
-                (provider, ext_event["id"], payload_hash)
+                """
+                SELECT id FROM raw_payloads 
+                WHERE provider_name = %s AND provider_event_id = %s AND payload_hash = %s;
+                """,
+                (provider_name, item['provider_event_id'], payload_hash)
             )
             if cursor.fetchone():
-                skipped += 1
+                duplicates_blocked += 1
                 continue
                 
-            # Store raw provider data payload
+            # --- Foreign Key Dependency Safeguard ---
+            # Check if the provider's venue ID exists inside our database mapping table
+            cursor.execute(
+                "SELECT canonical_id FROM source_mappings WHERE provider_name = %s AND external_id = %s AND entity_type = 'venue';",
+                (provider_name, item['venue_external_id'])
+            )
+            venue_map = cursor.fetchone()
+            
+            if venue_map:
+                resolved_venue_id = venue_map['canonical_id']
+            else:
+                # If the venue is new, instantly auto-generate it in the database to prevent foreign key errors
+                resolved_venue_id = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO venues (id, city_id, name, coordinates, timezone)
+                    VALUES (%s, %s, %s, point(0,0), %s) ON CONFLICT DO NOTHING;
+                    """,
+                    (resolved_venue_id, city['id'], item['venue_name'], item['timezone'])
+                )
+                # Map the reference for future pipeline runs
+                cursor.execute(
+                    "INSERT INTO source_mappings (provider_name, external_id, entity_type, canonical_id) VALUES (%s, %s, 'venue', %s);",
+                    (provider_name, item['venue_external_id'], resolved_venue_id)
+                )
+            
+            # 3. Store raw API data block securely inside Vault
             cursor.execute(
                 """
                 INSERT INTO raw_payloads (job_id, provider_name, provider_event_id, payload_json, payload_hash, processing_status)
                 VALUES (%s, %s, %s, %s, %s, 'processed');
                 """,
-                (job_id, provider, ext_event["id"], serialized_payload, payload_hash)
+                (job_id, provider_name, item['provider_event_id'], json.dumps(item['raw_data']), payload_hash)
             )
             
-            # Map items to our master database tables
-            canonical_id = str(uuid.uuid4())
+            # 4. Write record cleanly to Core Events engine
+            canonical_event_id = str(uuid.uuid4())
+            # Default fallback dates if API returns empty values
+            start_dt = item['start_time'] if item['start_time'] else '2026-10-15T20:00:00Z'
+            end_dt = item['start_time'] if item['start_time'] else '2026-10-16T02:00:00Z'
+            
             cursor.execute(
                 """
                 INSERT INTO events (id, venue_id, city_id, original_title, english_title, start_time, end_time, timezone, tags)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
                 """,
-                (
-                    canonical_id, 
-                    ext_event["venue_external_id"], 
-                    ext_event["city_external_id"],
-                    ext_event["name"], 
-                    ext_event["name"],
-                    ext_event["dates"]["start"]["dateTime"],
-                    ext_event["dates"]["end"]["dateTime"],
-                    ext_event["dates"]["start"]["timezone"],
-                    ext_event["tags"]
-                )
+                (canonical_event_id, resolved_venue_id, city['id'], item['title'], item['title'], start_dt, end_dt, item['timezone'], item['tags'])
             )
             
-            # Record structural mapping route entry
+            # 5. Connect mappings route trace
             cursor.execute(
                 "INSERT INTO source_mappings (provider_name, external_id, entity_type, canonical_id) VALUES (%s, %s, 'event', %s);",
-                (provider, ext_event["id"], canonical_id)
+                (provider_name, item['provider_event_id'], canonical_event_id)
             )
-            imported += 1
-            print(f"📡 Event Parsed & Ingested: {ext_event['name']}")
+            records_imported += 1
             
-        # Update job progress tracking stats
+        # Complete Job run cycle telemetry profiling logs
         cursor.execute(
             """
             UPDATE ingestion_jobs 
-            SET status = 'completed', finished_at = CURRENT_TIMESTAMP, 
+            SET status = 'completed', finished_at = CURRENT_TIMESTAMP,
                 records_found = %s, records_imported = %s, duplicates_found = %s
             WHERE id = %s;
             """,
-            (len(raw_events), imported, skipped, job_id)
+            (records_found, records_imported, duplicates_blocked, job_id)
         )
         conn.commit()
-        print(f"📊 Completed. New Records Added: {imported} | Duplicates Blocked: {skipped}")
+        print(f"📊 {city['english_name']} complete: +{records_imported} added | {duplicates_blocked} skipped.")
         
-    except Exception as e:
-        conn.rollback()
-        cursor.execute("UPDATE ingestion_jobs SET status = 'failed', error_log = %s WHERE id = %s;", (str(e), job_id))
-        conn.commit()
-        print(f"❌ Automation Error Encountered: {e}")
-    finally:
-        cursor.close()
-        conn.close()
+    cursor.close()
+    conn.close()
+    print("\n🏁 Global Sync Sequence Completed Successfully.")
 
 if __name__ == "__main__":
-    run_automated_sync()
+    run_global_sync()
